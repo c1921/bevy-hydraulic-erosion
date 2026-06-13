@@ -277,8 +277,8 @@ fn build_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
                 let b = a + 1;
                 let c = a + side;
                 let d = c + 1;
-                accumulate_face_normal(&mut normals, positions, a, b, c);
-                accumulate_face_normal(&mut normals, positions, b, d, c);
+                accumulate_face_normal(&mut normals, positions, a, c, b);
+                accumulate_face_normal(&mut normals, positions, b, c, d);
             }
         }
     }
