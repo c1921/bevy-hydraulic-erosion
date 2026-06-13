@@ -6,6 +6,7 @@ use noise::{NoiseFn, Perlin};
 
 use crate::config::{CELL_SIZE, GRID_SIZE, HEIGHT_AMP, HEIGHT_SCALE, LACUNARITY, NOISE_SCALE, OCTAVES, PERSISTENCE, DischargeOverlay, ErosionParams, PauseState};
 use crate::erosion;
+use crate::gpu_erosion::GpuMode;
 use crate::terrain_data::TerrainResource;
 
 // ── Color stops ─────────────────────────────────────────────────
@@ -305,8 +306,9 @@ pub(crate) fn update_erosion(
     mut terrain: ResMut<TerrainResource>,
     params: Res<ErosionParams>,
     pause: Res<PauseState>,
+    gpu_mode: Res<GpuMode>,
 ) {
-    if !pause.0 {
+    if !pause.0 && !gpu_mode.0 {
         erosion::erode(&mut terrain, &params);
     }
 }

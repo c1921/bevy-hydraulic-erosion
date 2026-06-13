@@ -8,3 +8,5 @@ bevy = "0.18.1"
 noise = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 rand = "0.9"
+wgpu = "27"
+pollster = "0.4"
