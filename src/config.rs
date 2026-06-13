@@ -31,6 +31,10 @@ pub(crate) const HEIGHT_SCALE: f32 = 3.0;
 #[derive(Resource, Default)]
 pub(crate) struct PauseState(pub bool);
 
+/// M 键切换：显示 discharge 热力图
+#[derive(Resource, Default)]
+pub(crate) struct DischargeOverlay(pub bool);
+
 #[derive(Resource)]
 pub(crate) struct ErosionParams {
     pub learning_rate: f32,

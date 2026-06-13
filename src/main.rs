@@ -14,6 +14,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .init_resource::<config::ErosionParams>()
         .init_resource::<config::PauseState>()
+        .init_resource::<config::DischargeOverlay>()
         .init_resource::<vegetation::PlantParams>()
         .init_resource::<vegetation::VegetationPlants>()
         .add_systems(Startup, (
@@ -21,7 +22,11 @@ fn main() {
             lighting::spawn_light,
             camera::spawn_camera,
         ))
-        .add_systems(PreUpdate, terrain::toggle_pause)
+        .add_systems(PreUpdate, (
+            terrain::toggle_pause,
+            terrain::toggle_overlay,
+            terrain::tune_params,
+        ))
         .add_systems(Update, (
             terrain::update_erosion,
             vegetation::update_vegetation,
