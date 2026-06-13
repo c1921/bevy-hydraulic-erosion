@@ -13,8 +13,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .init_resource::<config::ErosionParams>()
         .add_systems(Startup, (
-            terrain::generate_terrain,
-            terrain::spawn_terrain_mesh,
+            terrain::setup_terrain,
             lighting::spawn_light,
             camera::spawn_camera,
         ))

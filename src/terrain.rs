@@ -47,14 +47,21 @@ fn height_to_color(h: f32, h_min: f32, h_max: f32) -> LinearRgba {
     }
 }
 
-// ── Startup system 1: generate terrain data ─────────────────────
+// ── Startup system: create terrain data + build mesh ────────────
 
-pub(crate) fn generate_terrain(mut commands: Commands) {
+/// 1. 用 Perlin 噪声填充 TerrainResource
+/// 2. 从 TerrainResource 构建 Mesh
+/// 3. 插入 TerrainResource 资源 + spawn 地形实体
+pub(crate) fn setup_terrain(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     let n = GRID_SIZE + 1;
     let perlin = Perlin::new(42);
     let mut terrain = TerrainResource::new(n);
 
-    // First pass: generate raw heights
+    // -- generate raw heights --
     for z in 0..n {
         for x in 0..n {
             let mut h = 0.0f64;
@@ -69,7 +76,7 @@ pub(crate) fn generate_terrain(mut commands: Commands) {
         }
     }
 
-    // Normalize heights to [0, 1]
+    // -- normalize to [0, 1] --
     let h_min = terrain.cells_iter().map(|c| c.height).fold(f32::INFINITY, f32::min);
     let h_max = terrain.cells_iter().map(|c| c.height).fold(f32::NEG_INFINITY, f32::max);
     if h_max > h_min {
@@ -79,18 +86,13 @@ pub(crate) fn generate_terrain(mut commands: Commands) {
         }
     }
 
+    // -- build mesh from terrain data --
+    let mesh = build_mesh_from_terrain(&terrain);
+
+    // -- insert resource for later use (erosion, etc.) --
     commands.insert_resource(terrain);
-}
 
-// ── Startup system 2: build mesh from terrain data ─────────────
-
-pub(crate) fn spawn_terrain_mesh(
-    mut commands: Commands,
-    terrain: Res<TerrainResource>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let mesh = build_mesh_from_terrain(&*terrain);
+    // -- spawn mesh entity --
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -119,7 +121,7 @@ fn build_mesh_from_terrain(terrain: &TerrainResource) -> Mesh {
         for x in 0..n {
             let h = terrain.height_at(x, z);
             heights.push(h);
-            positions.push([x as f32 * cell, h * HEIGHT_AMP, z as f32 * cell]);
+            positions.push([x as f32 * cell, h * HEIGHT_AMP * 3.0, z as f32 * cell]);
         }
     }
 
