@@ -1,8 +1,8 @@
 use bevy::{
-    input::mouse::MouseWheel,
-    pbr::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
+    input::mouse::AccumulatedMouseScroll,
+    light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
+    mesh::{Indices, PrimitiveTopology},
     prelude::*,
-    render::mesh::{Indices, PrimitiveTopology},
 };
 use noise::{NoiseFn, Perlin};
 
@@ -62,7 +62,7 @@ fn setup(
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::WHITE, // multiplied with vertex colors
+            base_color: Color::WHITE,
             perceptual_roughness: 0.9,
             ..default()
         })),
@@ -92,9 +92,10 @@ fn setup(
     ));
 
     // ── ambient light ──
-    commands.insert_resource(AmbientLight {
+    commands.insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 400.0,
+        ..default()
     });
 
     // ── shadow map resolution ──
@@ -155,11 +156,11 @@ fn generate_terrain_mesh() -> Mesh {
 
     // colour stops — realistic topographic (no water)
     let stops: [(f32, LinearRgba); 5] = [
-        (0.00, LinearRgba::new(0.15, 0.35, 0.10, 1.0)), // lowland dark green
-        (0.30, LinearRgba::new(0.25, 0.55, 0.15, 1.0)), // mid green
-        (0.55, LinearRgba::new(0.55, 0.50, 0.20, 1.0)), // yellow-tan
-        (0.80, LinearRgba::new(0.40, 0.28, 0.15, 1.0)), // brown
-        (1.00, LinearRgba::new(0.85, 0.83, 0.80, 1.0)), // grey-white peak
+        (0.00, LinearRgba::new(0.15, 0.35, 0.10, 1.0)),
+        (0.30, LinearRgba::new(0.25, 0.55, 0.15, 1.0)),
+        (0.55, LinearRgba::new(0.55, 0.50, 0.20, 1.0)),
+        (0.80, LinearRgba::new(0.40, 0.28, 0.15, 1.0)),
+        (1.00, LinearRgba::new(0.85, 0.83, 0.80, 1.0)),
     ];
 
     for &h in &heights {
@@ -168,7 +169,6 @@ fn generate_terrain_mesh() -> Mesh {
         } else {
             0.5
         };
-        // linear interpolate between stops
         let c = if t <= stops[0].0 {
             stops[0].1
         } else if t >= stops[4].0 {
@@ -242,9 +242,9 @@ fn orbit_camera(
     mut ctrl: ResMut<CameraController>,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut scroll_ev: EventReader<MouseWheel>,
+    scroll: Res<AccumulatedMouseScroll>,
 ) {
-    let Ok(mut cam_transform) = query.get_single_mut() else {
+    let Ok(mut cam_transform) = query.single_mut() else {
         return;
     };
     let dt = time.delta_secs();
@@ -270,10 +270,8 @@ fn orbit_camera(
     }
 
     // ── zoom (scroll wheel) ──
-    for ev in scroll_ev.read() {
-        ctrl.distance -= ev.y * 30.0;
-        ctrl.distance = ctrl.distance.clamp(30.0, 600.0);
-    }
+    ctrl.distance -= scroll.delta.y * 30.0;
+    ctrl.distance = ctrl.distance.clamp(30.0, 600.0);
 
     // ── pan (WASD) ──
     let forward = Vec3::new(ctrl.yaw.sin(), 0.0, ctrl.yaw.cos()).normalize();
