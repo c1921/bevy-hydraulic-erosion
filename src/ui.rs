@@ -2,6 +2,7 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::prelude::*;
 
 use crate::config::{DischargeOverlay, ErosionParams, PauseState};
+use crate::gpu_erosion::GpuMode;
 use crate::vegetation::VegetationPlants;
 
 // ── Marker ──────────────────────────────────────────────────────
@@ -48,6 +49,7 @@ pub(crate) fn update_ui(
     mut frame: ResMut<FrameCount>,
     pause: Res<PauseState>,
     overlay: Res<DischargeOverlay>,
+    gpu_mode: Res<GpuMode>,
     params: Res<ErosionParams>,
     plants: Res<VegetationPlants>,
     diagnostics: Res<DiagnosticsStore>,
@@ -67,12 +69,14 @@ pub(crate) fn update_ui(
 
     let total_particles = frame.0 * params.cycles_per_frame as u64;
 
+    let mode = if gpu_mode.0 { "GPU [G]" } else { "CPU [G]" };
     let status = if pause.0 { "⏸ PAUSED" } else { "▶ RUNNING" };
     let heatmap = if overlay.0 { "ON [M]" } else { "OFF [M]" };
 
     text.0 = format!(
         "Hydraulic Erosion\n\
          ─────────────────\n\
+         Mode:        {mode}\n\
          Status:      {status}\n\
          Heatmap:     {heatmap}\n\
          FPS:         {fps}\n\

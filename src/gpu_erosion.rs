@@ -67,7 +67,10 @@ struct GpuCtx {
     track_x: Option<wgpu::Buffer>,
     track_y: Option<wgpu::Buffer>,
     params_buf: Option<wgpu::Buffer>,
-    staging: Option<wgpu::Buffer>,
+    staging_h: Option<wgpu::Buffer>,
+    staging_dt: Option<wgpu::Buffer>,
+    staging_mx: Option<wgpu::Buffer>,
+    staging_my: Option<wgpu::Buffer>,
 
     buf_len: u64,
 }
@@ -163,7 +166,10 @@ impl GpuCtx {
             track_x: None,
             track_y: None,
             params_buf: None,
-            staging: None,
+            staging_h: None,
+            staging_dt: None,
+            staging_mx: None,
+            staging_my: None,
             buf_len: 0,
         })
     }
@@ -200,10 +206,18 @@ impl GpuCtx {
         self.track_y = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ty"), size: bytes, usage: usage_sr, mapped_at_creation: false,
         }));
-        self.staging = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stg"), size: bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+        let staging_usage = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ;
+        self.staging_h = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stg_h"), size: bytes, usage: staging_usage, mapped_at_creation: false,
+        }));
+        self.staging_dt = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stg_dt"), size: bytes, usage: staging_usage, mapped_at_creation: false,
+        }));
+        self.staging_mx = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stg_mx"), size: bytes, usage: staging_usage, mapped_at_creation: false,
+        }));
+        self.staging_my = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stg_my"), size: bytes, usage: staging_usage, mapped_at_creation: false,
         }));
         self.params_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("p"),
@@ -223,10 +237,10 @@ impl GpuCtx {
         roots: &[f32],
         params: &GpuErosionParams,
         cycles: u32,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let n = heights.len() as u64;
         if n == 0 {
-            return vec![];
+            return (vec![], vec![], vec![], vec![]);
         }
         self.ensure_bufs(n);
         let nb = n as usize * 4;
@@ -269,7 +283,10 @@ impl GpuCtx {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(wgs, 1, 1);
         }
-        enc.copy_buffer_to_buffer(self.heights.as_ref().unwrap(), 0, self.staging.as_ref().unwrap(), 0, nb as u64);
+        enc.copy_buffer_to_buffer(self.heights.as_ref().unwrap(), 0, self.staging_h.as_ref().unwrap(), 0, nb as u64);
+        enc.copy_buffer_to_buffer(self.track_d.as_ref().unwrap(), 0, self.staging_dt.as_ref().unwrap(), 0, nb as u64);
+        enc.copy_buffer_to_buffer(self.track_x.as_ref().unwrap(), 0, self.staging_mx.as_ref().unwrap(), 0, nb as u64);
+        enc.copy_buffer_to_buffer(self.track_y.as_ref().unwrap(), 0, self.staging_my.as_ref().unwrap(), 0, nb as u64);
 
         let idx = self.queue.submit(std::iter::once(enc.finish()));
         let _ = self.device.poll(wgpu::PollType::Wait {
@@ -277,27 +294,69 @@ impl GpuCtx {
             timeout: None,
         });
 
-        let slice = self.staging.as_ref().unwrap().slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
+        // Readback helper
+        let read_staging = |staging: &wgpu::Buffer, device: &wgpu::Device| -> Vec<f32> {
+            let slice = staging.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+            let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            if rx.recv().is_ok() {
+                let mapped = slice.get_mapped_range();
+                let out: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+                drop(mapped);
+                staging.unmap();
+                out
+            } else {
+                vec![]
+            }
+        };
 
-        if rx.recv().is_ok() {
-            let mapped = slice.get_mapped_range();
-            let out: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
-            drop(mapped);
-            self.staging.as_ref().unwrap().unmap();
-            out
-        } else {
-            heights.to_vec()
-        }
+        let h_out = read_staging(self.staging_h.as_ref().unwrap(), &self.device);
+        let dt_out = read_staging(self.staging_dt.as_ref().unwrap(), &self.device);
+        let mx_out = read_staging(self.staging_mx.as_ref().unwrap(), &self.device);
+        let my_out = read_staging(self.staging_my.as_ref().unwrap(), &self.device);
+
+        (h_out, dt_out, mx_out, my_out)
     }
 }
 
 // ── Bevy integration ────────────────────────────────────────────
+
+/// CPU-side cascade for a single cell (used for GPU post-processing)
+fn cascade_cell(terrain: &mut TerrainResource, x: usize, z: usize, max_diff: f32, settling: f32) {
+    let cur_h = terrain.height_at(x, z);
+    let neighbors: [(i32, i32, f32); 8] = [
+        (-1, -1, 1.414), (-1, 0, 1.0), (-1, 1, 1.414),
+        (0, -1, 1.0),                   (0, 1, 1.0),
+        (1, -1, 1.414),  (1, 0, 1.0),  (1, 1, 1.414),
+    ];
+
+    for &(dx, dz, dist) in &neighbors {
+        let nx = x as i32 + dx;
+        let nz = z as i32 + dz;
+        if terrain.oob_i32(nx, nz) {
+            continue;
+        }
+        let nh = terrain.height_at(nx as usize, nz as usize);
+        let diff = cur_h - nh;
+        if diff == 0.0 {
+            continue;
+        }
+        let excess = if nh > 0.1 {
+            (diff.abs() - dist * max_diff).max(0.0)
+        } else {
+            diff.abs()
+        };
+        if excess <= 0.0 {
+            continue;
+        }
+        let transfer = settling * excess / 2.0;
+        if diff > 0.0 {
+            terrain.cell_mut(x, z).height -= transfer;
+            terrain.cell_mut(nx as usize, nz as usize).height += transfer;
+        }
+    }
+}
 
 #[derive(Resource)]
 pub(crate) struct GpuErosionRes {
@@ -305,8 +364,14 @@ pub(crate) struct GpuErosionRes {
     ready: bool,
 }
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub(crate) struct GpuMode(pub bool);
+
+impl Default for GpuMode {
+    fn default() -> Self {
+        Self(true)
+    }
+}
 
 pub(crate) struct GpuErosionPlugin;
 
@@ -371,7 +436,7 @@ pub(crate) fn gpu_erode(
     let gp = GpuErosionParams::from_cpu(&params, n as u32, frame.0 as u32);
     let cycles = params.cycles_per_frame as u32;
 
-    let result = {
+    let (h_out, dt_out, mx_out, my_out) = {
         let mut ctx = gpu.ctx.lock().unwrap();
         ctx.run(&h, &d, &mx, &my, &r, &gp, cycles)
     };
@@ -380,9 +445,31 @@ pub(crate) fn gpu_erode(
     for z in 0..n {
         for x in 0..n {
             let idx = z * n + x;
-            if idx < result.len() {
-                terrain.cell_mut(x, z).height = result[idx];
+            if idx < h_out.len() {
+                terrain.cell_mut(x, z).height = h_out[idx];
             }
+        }
+    }
+
+    // Merge tracking via EMA (same as CPU erosion::erode does after particle loop)
+    if dt_out.len() == total && mx_out.len() == total && my_out.len() == total {
+        for z in 0..n {
+            for x in 0..n {
+                let idx = z * n + x;
+                let cell = terrain.cell_mut(x, z);
+                cell.discharge_track = dt_out[idx];
+                cell.momentum_x_track = mx_out[idx];
+                cell.momentum_y_track = my_out[idx];
+            }
+        }
+        terrain.merge_tracking(params.learning_rate);
+    }
+
+    // Cascade (CPU-side — simple and avoids GPU double-buffer complexity)
+    // Use a lightweight pass: iterate cells, smooth steep neighbors
+    for z in 0..n {
+        for x in 0..n {
+            cascade_cell(&mut terrain, x, z, params.max_diff, params.settling_rate);
         }
     }
 }
