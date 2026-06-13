@@ -24,6 +24,13 @@ pub(crate) const PERSISTENCE: f64 = 0.5;
 
 // ── Erosion parameters ──────────────────────────────────────────
 
+/// 渲染高度缩放倍数（相对 HEIGHT_AMP）
+pub(crate) const HEIGHT_SCALE: f32 = 3.0;
+
+/// 暂停侵蚀模拟
+#[derive(Resource, Default)]
+pub(crate) struct PauseState(pub bool);
+
 #[derive(Resource)]
 pub(crate) struct ErosionParams {
     pub learning_rate: f32,

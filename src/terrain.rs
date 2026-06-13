@@ -4,7 +4,8 @@ use bevy::{
 };
 use noise::{NoiseFn, Perlin};
 
-use crate::config::{CELL_SIZE, GRID_SIZE, HEIGHT_AMP, LACUNARITY, NOISE_SCALE, OCTAVES, PERSISTENCE};
+use crate::config::{CELL_SIZE, GRID_SIZE, HEIGHT_AMP, HEIGHT_SCALE, LACUNARITY, NOISE_SCALE, OCTAVES, PERSISTENCE, PauseState};
+use crate::erosion;
 use crate::terrain_data::TerrainResource;
 
 // ── Color stops ─────────────────────────────────────────────────
@@ -47,11 +48,13 @@ fn height_to_color(h: f32, h_min: f32, h_max: f32) -> LinearRgba {
     }
 }
 
+// ── Terrain mesh handle resource ────────────────────────────────
+
+#[derive(Resource)]
+pub(crate) struct TerrainMeshHandle(pub Handle<Mesh>);
+
 // ── Startup system: create terrain data + build mesh ────────────
 
-/// 1. 用 Perlin 噪声填充 TerrainResource
-/// 2. 从 TerrainResource 构建 Mesh
-/// 3. 插入 TerrainResource 资源 + spawn 地形实体
 pub(crate) fn setup_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -87,14 +90,17 @@ pub(crate) fn setup_terrain(
     }
 
     // -- build mesh from terrain data --
-    let mesh = build_mesh_from_terrain(&terrain);
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+    write_mesh_attributes(&mut mesh, &terrain);
+    let mesh_handle = meshes.add(mesh);
 
-    // -- insert resource for later use (erosion, etc.) --
+    // -- insert resource + store handle --
     commands.insert_resource(terrain);
+    commands.insert_resource(TerrainMeshHandle(mesh_handle.clone()));
 
     // -- spawn mesh entity --
     commands.spawn((
-        Mesh3d(meshes.add(mesh)),
+        Mesh3d(mesh_handle),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 0.9,
@@ -104,11 +110,13 @@ pub(crate) fn setup_terrain(
     ));
 }
 
-// ── Mesh construction ───────────────────────────────────────────
+// ── Mesh attribute writing (reusable) ───────────────────────────
 
-fn build_mesh_from_terrain(terrain: &TerrainResource) -> Mesh {
+/// 将 TerrainResource 的高度数据写入 Mesh 的顶点缓冲（positions + normals + colors + indices）
+fn write_mesh_attributes(mesh: &mut Mesh, terrain: &TerrainResource) {
     let n = terrain.size;
     let cell = CELL_SIZE;
+    let height_scale = HEIGHT_AMP * HEIGHT_SCALE;
 
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * n);
     let mut colors: Vec<[f32; 4]> = Vec::with_capacity(n * n);
@@ -121,7 +129,7 @@ fn build_mesh_from_terrain(terrain: &TerrainResource) -> Mesh {
         for x in 0..n {
             let h = terrain.height_at(x, z);
             heights.push(h);
-            positions.push([x as f32 * cell, h * HEIGHT_AMP * 3.0, z as f32 * cell]);
+            positions.push([x as f32 * cell, h * height_scale, z as f32 * cell]);
         }
     }
 
@@ -163,12 +171,45 @@ fn build_mesh_from_terrain(terrain: &TerrainResource) -> Mesh {
         .map(|n| n.normalize_or_zero().to_array())
         .collect();
 
-    // -- assemble --
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+    // -- write into mesh (replace existing attributes) --
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals_arr);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.remove_indices();
     mesh.insert_indices(Indices::U32(indices));
+}
 
-    mesh
+// ── Update: erosion ─────────────────────────────────────────────
+
+pub(crate) fn update_erosion(
+    mut terrain: ResMut<TerrainResource>,
+    params: Res<crate::config::ErosionParams>,
+    pause: Res<PauseState>,
+) {
+    if !pause.0 {
+        erosion::erode(&mut terrain, &params);
+    }
+}
+
+// ── Update: mesh refresh ────────────────────────────────────────
+
+pub(crate) fn update_mesh(
+    terrain: Res<TerrainResource>,
+    handle: Res<TerrainMeshHandle>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
+    if let Some(mesh) = meshes.get_mut(&handle.0) {
+        write_mesh_attributes(mesh, &terrain);
+    }
+}
+
+// ── Input: pause toggle ─────────────────────────────────────────
+
+pub(crate) fn toggle_pause(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut pause: ResMut<PauseState>,
+) {
+    if keys.just_pressed(KeyCode::Space) {
+        pause.0 = !pause.0;
+    }
 }
