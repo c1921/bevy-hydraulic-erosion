@@ -16,10 +16,13 @@ fn main() {
 
 // ── Terrain config ──────────────────────────────────────────────
 
-const TERRAIN_SIZE: usize = 200;
+const TERRAIN_SIZE: usize = 512;
 const CELL_SIZE: f32 = 2.0;
 const NOISE_SCALE: f64 = 0.015;
 const HEIGHT_AMP: f32 = 30.0;
+const OCTAVES: usize = 6;
+const LACUNARITY: f64 = 2.0;
+const PERSISTENCE: f64 = 0.5;
 
 // ── Camera controller resource ──────────────────────────────────
 
@@ -121,8 +124,15 @@ fn generate_terrain_mesh() -> Mesh {
     let mut heights: Vec<f32> = Vec::with_capacity(n * n);
     for z in 0..n {
         for x in 0..n {
-            let h = perlin.get([x as f64 * NOISE_SCALE, z as f64 * NOISE_SCALE]) as f32
-                * HEIGHT_AMP;
+            let mut h = 0.0f64;
+            let mut freq = NOISE_SCALE;
+            let mut amp = 1.0;
+            for _ in 0..OCTAVES {
+                h += perlin.get([x as f64 * freq, z as f64 * freq]) * amp;
+                freq *= LACUNARITY;
+                amp *= PERSISTENCE;
+            }
+            let h = h as f32 * HEIGHT_AMP;
             heights.push(h);
             positions.push([x as f32 * cell, h, z as f32 * cell]);
         }
