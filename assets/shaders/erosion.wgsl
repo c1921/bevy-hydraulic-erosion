@@ -24,6 +24,8 @@ struct ErosionParams {
     momentum_transfer: f32,
     cycles_per_frame: u32,   // particles to spawn per dispatch
     frame_seed: u32,         // random seed (changes each frame)
+    one_minus_evap_rate: f32,      // precomputed: 1.0 - evaporation_rate
+    inv_one_minus_evap_rate: f32,  // precomputed: 1.0 / one_minus_evap_rate
 }
 
 @group(0) @binding(0) var<storage, read_write> heights: array<f32>;
@@ -142,6 +144,11 @@ struct Particle {
     volume: f32,
     sediment: f32,
     age: u32,
+    // Cached per-step values — recomputed only when cell changes
+    cache_cx: u32,
+    cache_cz: u32,
+    cache_normal: vec3<f32>,
+    cache_disc_erf: f32,
 }
 
 fn descend_step(p: ptr<function, Particle>) -> bool {
@@ -172,8 +179,14 @@ fn descend_step(p: ptr<function, Particle>) -> bool {
     // ── Effective deposition ──
     let eff_depo = params.deposition_rate * max(0.0, 1.0 - root_density[idx]);
 
-    // ── Normal + gravity ──
-    let n = compute_normal(ix, iz);
+    // ── Normal + gravity (cached per cell) ──
+    if ix != (*p).cache_cx || iz != (*p).cache_cz {
+        (*p).cache_cx = ix;
+        (*p).cache_cz = iz;
+        (*p).cache_normal = compute_normal(ix, iz);
+        (*p).cache_disc_erf = discharge_erf(idx);
+    }
+    let n = (*p).cache_normal;
     (*p).speed_x += n.x * params.gravity / (*p).volume;
     (*p).speed_z += n.z * params.gravity / (*p).volume;
 
@@ -250,8 +263,8 @@ fn descend_step(p: ptr<function, Particle>) -> bool {
         }
     }
 
-    // ── Mass transfer ──
-    let disc = read_discharge(ix, iz);
+    // ── Mass transfer (uses cached discharge_erf) ──
+    let disc = (*p).cache_disc_erf;
     var c_eq = (1.0 + params.entrainment * disc) * (cell_height - new_height);
     if c_eq < 0.0 {
         c_eq = 0.0;
@@ -262,9 +275,9 @@ fn descend_step(p: ptr<function, Particle>) -> bool {
     // Height write is non-atomic (benign race)
     heights[idx] -= eff_depo * c_diff;
 
-    // ── Evaporation ──
-    (*p).sediment /= (1.0 - params.evaporation_rate);
-    (*p).volume *= (1.0 - params.evaporation_rate);
+    // ── Evaporation (uses precomputed constants) ──
+    (*p).sediment *= params.inv_one_minus_evap_rate;
+    (*p).volume *= params.one_minus_evap_rate;
 
     // ── Final OOB ──
     if oob(i32(floor((*p).pos_x)), i32(floor((*p).pos_z))) {
@@ -306,6 +319,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     p.volume = 1.0;
     p.sediment = 0.0;
     p.age = 0u;
+    p.cache_cx = params.grid_size; // sentinel: force initial compute
+    p.cache_cz = params.grid_size;
+    p.cache_normal = vec3(0.0);
+    p.cache_disc_erf = 0.0;
 
     loop {
         if !descend_step(&p) {

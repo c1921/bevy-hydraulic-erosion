@@ -28,11 +28,15 @@ struct GpuErosionParams {
     momentum_transfer: f32,
     cycles_per_frame: u32,
     frame_seed: u32,
-    _pad: u32,
+    /// Precomputed: 1.0 - evaporation_rate
+    one_minus_evaporation_rate: f32,
+    /// Precomputed: 1.0 / one_minus_evaporation_rate
+    inv_one_minus_evaporation_rate: f32,
 }
 
 impl GpuErosionParams {
     fn from_cpu(params: &ErosionParams, grid_size: u32, frame_seed: u32) -> Self {
+        let one_minus = 1.0 - params.evaporation_rate;
         Self {
             grid_size,
             map_scale: MAP_SCALE,
@@ -45,7 +49,8 @@ impl GpuErosionParams {
             momentum_transfer: params.momentum_transfer,
             cycles_per_frame: params.cycles_per_frame as u32,
             frame_seed,
-            _pad: 0,
+            one_minus_evaporation_rate: one_minus,
+            inv_one_minus_evaporation_rate: 1.0 / one_minus,
         }
     }
 }
@@ -67,10 +72,19 @@ struct GpuCtx {
     track_x: Option<wgpu::Buffer>,
     track_y: Option<wgpu::Buffer>,
     params_buf: Option<wgpu::Buffer>,
-    staging_h: Option<wgpu::Buffer>,
-    staging_dt: Option<wgpu::Buffer>,
-    staging_mx: Option<wgpu::Buffer>,
-    staging_my: Option<wgpu::Buffer>,
+    /// Single staging buffer for readback (4 × n floats: h, dt, mx, my)
+    staging: Option<wgpu::Buffer>,
+
+    /// Cached bind group — reused across frames; rebuilt only when buffers resize.
+    bg: Option<wgpu::BindGroup>,
+
+    /// Scratch CPU buffers reused across frames to avoid per-frame allocations.
+    scratch_h: Vec<f32>,
+    scratch_d: Vec<f32>,
+    scratch_mx: Vec<f32>,
+    scratch_my: Vec<f32>,
+    scratch_r: Vec<f32>,
+    zeros: Vec<u8>,
 
     buf_len: u64,
 }
@@ -166,10 +180,14 @@ impl GpuCtx {
             track_x: None,
             track_y: None,
             params_buf: None,
-            staging_h: None,
-            staging_dt: None,
-            staging_mx: None,
-            staging_my: None,
+            staging: None,
+            bg: None,
+            scratch_h: Vec::new(),
+            scratch_d: Vec::new(),
+            scratch_mx: Vec::new(),
+            scratch_my: Vec::new(),
+            scratch_r: Vec::new(),
+            zeros: Vec::new(),
             buf_len: 0,
         })
     }
@@ -207,17 +225,9 @@ impl GpuCtx {
             label: Some("ty"), size: bytes, usage: usage_sr, mapped_at_creation: false,
         }));
         let staging_usage = wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ;
-        self.staging_h = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stg_h"), size: bytes, usage: staging_usage, mapped_at_creation: false,
-        }));
-        self.staging_dt = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stg_dt"), size: bytes, usage: staging_usage, mapped_at_creation: false,
-        }));
-        self.staging_mx = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stg_mx"), size: bytes, usage: staging_usage, mapped_at_creation: false,
-        }));
-        self.staging_my = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stg_my"), size: bytes, usage: staging_usage, mapped_at_creation: false,
+        // Single staging buffer: 4 arrays (h, dt, mx, my) laid out consecutively
+        self.staging = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stg"), size: bytes * 4, usage: staging_usage, mapped_at_creation: false,
         }));
         self.params_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("p"),
@@ -226,38 +236,9 @@ impl GpuCtx {
             mapped_at_creation: false,
         }));
         self.buf_len = n;
-    }
 
-    fn run(
-        &mut self,
-        heights: &[f32],
-        discharges: &[f32],
-        mx: &[f32],
-        my: &[f32],
-        roots: &[f32],
-        params: &GpuErosionParams,
-        cycles: u32,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let n = heights.len() as u64;
-        if n == 0 {
-            return (vec![], vec![], vec![], vec![]);
-        }
-        self.ensure_bufs(n);
-        let nb = n as usize * 4;
-
-        self.queue.write_buffer(self.heights.as_ref().unwrap(), 0, bytemuck::cast_slice(heights));
-        self.queue.write_buffer(self.discharges.as_ref().unwrap(), 0, bytemuck::cast_slice(discharges));
-        self.queue.write_buffer(self.mom_x.as_ref().unwrap(), 0, bytemuck::cast_slice(mx));
-        self.queue.write_buffer(self.mom_y.as_ref().unwrap(), 0, bytemuck::cast_slice(my));
-        self.queue.write_buffer(self.roots.as_ref().unwrap(), 0, bytemuck::cast_slice(roots));
-        self.queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(params));
-
-        let zeros = vec![0u8; nb];
-        self.queue.write_buffer(self.track_d.as_ref().unwrap(), 0, &zeros);
-        self.queue.write_buffer(self.track_x.as_ref().unwrap(), 0, &zeros);
-        self.queue.write_buffer(self.track_y.as_ref().unwrap(), 0, &zeros);
-
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        // Build cached bind group (rebuilt only when buffers resize)
+        self.bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg"),
             layout: &self.bgl,
             entries: &[
@@ -271,7 +252,37 @@ impl GpuCtx {
                 wgpu::BindGroupEntry { binding: 7, resource: self.track_y.as_ref().unwrap().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.params_buf.as_ref().unwrap().as_entire_binding() },
             ],
-        });
+        }));
+    }
+
+    fn run(
+        &mut self,
+        params: &GpuErosionParams,
+        cycles: u32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = self.scratch_h.len() as u64;
+        if n == 0 {
+            return (vec![], vec![], vec![], vec![]);
+        }
+        self.ensure_bufs(n);
+        let nb = n as usize * 4;
+
+        self.queue.write_buffer(self.heights.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.scratch_h));
+        self.queue.write_buffer(self.discharges.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.scratch_d));
+        self.queue.write_buffer(self.mom_x.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.scratch_mx));
+        self.queue.write_buffer(self.mom_y.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.scratch_my));
+        self.queue.write_buffer(self.roots.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.scratch_r));
+        self.queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(params));
+
+        let zeros = {
+            self.zeros.resize(nb, 0u8);
+            &self.zeros
+        };
+        self.queue.write_buffer(self.track_d.as_ref().unwrap(), 0, zeros);
+        self.queue.write_buffer(self.track_x.as_ref().unwrap(), 0, zeros);
+        self.queue.write_buffer(self.track_y.as_ref().unwrap(), 0, zeros);
+
+        let bg = self.bg.as_ref().expect("bind group not created");
 
         let wgs = ((cycles as u64 + 63) / 64) as u32;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
@@ -280,13 +291,13 @@ impl GpuCtx {
                 label: Some("pass"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(wgs, 1, 1);
         }
-        enc.copy_buffer_to_buffer(self.heights.as_ref().unwrap(), 0, self.staging_h.as_ref().unwrap(), 0, nb as u64);
-        enc.copy_buffer_to_buffer(self.track_d.as_ref().unwrap(), 0, self.staging_dt.as_ref().unwrap(), 0, nb as u64);
-        enc.copy_buffer_to_buffer(self.track_x.as_ref().unwrap(), 0, self.staging_mx.as_ref().unwrap(), 0, nb as u64);
-        enc.copy_buffer_to_buffer(self.track_y.as_ref().unwrap(), 0, self.staging_my.as_ref().unwrap(), 0, nb as u64);
+        enc.copy_buffer_to_buffer(self.heights.as_ref().unwrap(), 0, self.staging.as_ref().unwrap(), 0, nb as u64);
+        enc.copy_buffer_to_buffer(self.track_d.as_ref().unwrap(), 0, self.staging.as_ref().unwrap(), nb as u64, nb as u64);
+        enc.copy_buffer_to_buffer(self.track_x.as_ref().unwrap(), 0, self.staging.as_ref().unwrap(), 2 * nb as u64, nb as u64);
+        enc.copy_buffer_to_buffer(self.track_y.as_ref().unwrap(), 0, self.staging.as_ref().unwrap(), 3 * nb as u64, nb as u64);
 
         let idx = self.queue.submit(std::iter::once(enc.finish()));
         let _ = self.device.poll(wgpu::PollType::Wait {
@@ -294,27 +305,27 @@ impl GpuCtx {
             timeout: None,
         });
 
-        // Readback helper
-        let read_staging = |staging: &wgpu::Buffer, device: &wgpu::Device| -> Vec<f32> {
-            let slice = staging.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
-            let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-            if rx.recv().is_ok() {
-                let mapped = slice.get_mapped_range();
-                let out: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
-                drop(mapped);
-                staging.unmap();
-                out
-            } else {
-                vec![]
-            }
-        };
+        // Single readback of merged staging buffer
+        let staging = self.staging.as_ref().unwrap();
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
 
-        let h_out = read_staging(self.staging_h.as_ref().unwrap(), &self.device);
-        let dt_out = read_staging(self.staging_dt.as_ref().unwrap(), &self.device);
-        let mx_out = read_staging(self.staging_mx.as_ref().unwrap(), &self.device);
-        let my_out = read_staging(self.staging_my.as_ref().unwrap(), &self.device);
+        let (h_out, dt_out, mx_out, my_out) = if rx.recv().is_ok() {
+            let mapped = slice.get_mapped_range();
+            let all: &[f32] = bytemuck::cast_slice(&mapped);
+            let nf = n as usize;
+            let h_out   = all[0..nf].to_vec();
+            let dt_out  = all[nf..2*nf].to_vec();
+            let mx_out  = all[2*nf..3*nf].to_vec();
+            let my_out  = all[3*nf..4*nf].to_vec();
+            drop(mapped);
+            staging.unmap();
+            (h_out, dt_out, mx_out, my_out)
+        } else {
+            (vec![], vec![], vec![], vec![])
+        };
 
         (h_out, dt_out, mx_out, my_out)
     }
@@ -416,29 +427,31 @@ pub(crate) fn gpu_erode(
 
     let n = terrain.size;
     let total = n * n;
-    let mut h = Vec::with_capacity(total);
-    let mut d = Vec::with_capacity(total);
-    let mut mx = Vec::with_capacity(total);
-    let mut my = Vec::with_capacity(total);
-    let mut r = Vec::with_capacity(total);
-
-    for z in 0..n {
-        for x in 0..n {
-            let c = terrain.cell(x, z);
-            h.push(c.height);
-            d.push(c.discharge);
-            mx.push(c.momentum_x);
-            my.push(c.momentum_y);
-            r.push(c.root_density);
-        }
-    }
 
     let gp = GpuErosionParams::from_cpu(&params, n as u32, frame.0 as u32);
     let cycles = params.cycles_per_frame as u32;
 
     let (h_out, dt_out, mx_out, my_out) = {
         let mut ctx = gpu.ctx.lock().unwrap();
-        ctx.run(&h, &d, &mx, &my, &r, &gp, cycles)
+
+        // Reuse scratch buffers — clear + fill from terrain
+        ctx.scratch_h.clear();
+        ctx.scratch_d.clear();
+        ctx.scratch_mx.clear();
+        ctx.scratch_my.clear();
+        ctx.scratch_r.clear();
+        for z in 0..n {
+            for x in 0..n {
+                let c = terrain.cell(x, z);
+                ctx.scratch_h.push(c.height);
+                ctx.scratch_d.push(c.discharge);
+                ctx.scratch_mx.push(c.momentum_x);
+                ctx.scratch_my.push(c.momentum_y);
+                ctx.scratch_r.push(c.root_density);
+            }
+        }
+
+        ctx.run(&gp, cycles)
     };
 
     // Write back heights
