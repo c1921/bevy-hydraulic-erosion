@@ -351,6 +351,7 @@ name = "bevy-hydraulic-erosion"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "noise",
 ]
 

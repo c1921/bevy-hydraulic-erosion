@@ -1,6 +1,6 @@
 use bevy::{input::mouse::AccumulatedMouseScroll, prelude::*};
 
-use crate::terrain::{CELL_SIZE, TERRAIN_SIZE};
+use crate::config::{CELL_SIZE, GRID_SIZE};
 
 // ── Camera controller resource ──────────────────────────────────
 
@@ -19,9 +19,9 @@ impl Default for CameraController {
             pitch: 0.8,
             distance: 250.0,
             center: Vec3::new(
-                TERRAIN_SIZE as f32 * CELL_SIZE / 2.0,
+                GRID_SIZE as f32 * CELL_SIZE / 2.0,
                 5.0,
-                TERRAIN_SIZE as f32 * CELL_SIZE / 2.0,
+                GRID_SIZE as f32 * CELL_SIZE / 2.0,
             ),
         }
     }

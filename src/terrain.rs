@@ -4,24 +4,93 @@ use bevy::{
 };
 use noise::{NoiseFn, Perlin};
 
-// ── Terrain config ──────────────────────────────────────────────
+use crate::config::{CELL_SIZE, GRID_SIZE, HEIGHT_AMP, LACUNARITY, NOISE_SCALE, OCTAVES, PERSISTENCE};
+use crate::terrain_data::TerrainResource;
 
-pub(crate) const TERRAIN_SIZE: usize = 512;
-pub(crate) const CELL_SIZE: f32 = 2.0;
-const NOISE_SCALE: f64 = 0.015;
-const HEIGHT_AMP: f32 = 30.0;
-const OCTAVES: usize = 6;
-const LACUNARITY: f64 = 2.0;
-const PERSISTENCE: f64 = 0.5;
+// ── Color stops ─────────────────────────────────────────────────
 
-// ── Startup system ──────────────────────────────────────────────
+fn lerp_color(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
+    LinearRgba::new(
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+        a.alpha + (b.alpha - a.alpha) * t,
+    )
+}
 
-pub(crate) fn spawn_terrain(
+const COLOR_STOPS: [(f32, LinearRgba); 5] = [
+    (0.00, LinearRgba::new(0.15, 0.35, 0.10, 1.0)),
+    (0.30, LinearRgba::new(0.25, 0.55, 0.15, 1.0)),
+    (0.55, LinearRgba::new(0.55, 0.50, 0.20, 1.0)),
+    (0.80, LinearRgba::new(0.40, 0.28, 0.15, 1.0)),
+    (1.00, LinearRgba::new(0.85, 0.83, 0.80, 1.0)),
+];
+
+fn height_to_color(h: f32, h_min: f32, h_max: f32) -> LinearRgba {
+    let h_range = h_max - h_min;
+    let t = if h_range > 0.0 {
+        ((h - h_min) / h_range).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    if t <= COLOR_STOPS[0].0 {
+        COLOR_STOPS[0].1
+    } else if t >= COLOR_STOPS[4].0 {
+        COLOR_STOPS[4].1
+    } else {
+        let mut lo = 0;
+        while COLOR_STOPS[lo + 1].0 < t {
+            lo += 1;
+        }
+        let s = (t - COLOR_STOPS[lo].0) / (COLOR_STOPS[lo + 1].0 - COLOR_STOPS[lo].0);
+        lerp_color(COLOR_STOPS[lo].1, COLOR_STOPS[lo + 1].1, s)
+    }
+}
+
+// ── Startup system 1: generate terrain data ─────────────────────
+
+pub(crate) fn generate_terrain(mut commands: Commands) {
+    let n = GRID_SIZE + 1;
+    let perlin = Perlin::new(42);
+    let mut terrain = TerrainResource::new(n);
+
+    // First pass: generate raw heights
+    for z in 0..n {
+        for x in 0..n {
+            let mut h = 0.0f64;
+            let mut freq = NOISE_SCALE;
+            let mut amp = 1.0;
+            for _ in 0..OCTAVES {
+                h += perlin.get([x as f64 * freq, z as f64 * freq]) * amp;
+                freq *= LACUNARITY;
+                amp *= PERSISTENCE;
+            }
+            terrain.set_height(x, z, h as f32 * HEIGHT_AMP);
+        }
+    }
+
+    // Normalize heights to [0, 1]
+    let h_min = terrain.cells_iter().map(|c| c.height).fold(f32::INFINITY, f32::min);
+    let h_max = terrain.cells_iter().map(|c| c.height).fold(f32::NEG_INFINITY, f32::max);
+    if h_max > h_min {
+        let inv_range = 1.0 / (h_max - h_min);
+        for cell in terrain.cells_mut_iter() {
+            cell.height = (cell.height - h_min) * inv_range;
+        }
+    }
+
+    commands.insert_resource(terrain);
+}
+
+// ── Startup system 2: build mesh from terrain data ─────────────
+
+pub(crate) fn spawn_terrain_mesh(
     mut commands: Commands,
+    terrain: Res<TerrainResource>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let mesh = generate_terrain_mesh();
+    let mesh = build_mesh_from_terrain(&*terrain);
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -33,20 +102,10 @@ pub(crate) fn spawn_terrain(
     ));
 }
 
-// ── Mesh generation ─────────────────────────────────────────────
+// ── Mesh construction ───────────────────────────────────────────
 
-fn lerp_color(a: LinearRgba, b: LinearRgba, t: f32) -> LinearRgba {
-    LinearRgba::new(
-        a.red + (b.red - a.red) * t,
-        a.green + (b.green - a.green) * t,
-        a.blue + (b.blue - a.blue) * t,
-        a.alpha + (b.alpha - a.alpha) * t,
-    )
-}
-
-fn generate_terrain_mesh() -> Mesh {
-    let perlin = Perlin::new(42);
-    let n = TERRAIN_SIZE + 1;
+fn build_mesh_from_terrain(terrain: &TerrainResource) -> Mesh {
+    let n = terrain.size;
     let cell = CELL_SIZE;
 
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n * n);
@@ -54,60 +113,28 @@ fn generate_terrain_mesh() -> Mesh {
     let mut normals = vec![Vec3::ZERO; n * n];
     let mut indices: Vec<u32> = Vec::new();
 
-    // -- vertices (two-pass: first collect heights, then normalize & colour) --
+    // -- collect heights & positions --
     let mut heights: Vec<f32> = Vec::with_capacity(n * n);
     for z in 0..n {
         for x in 0..n {
-            let mut h = 0.0f64;
-            let mut freq = NOISE_SCALE;
-            let mut amp = 1.0;
-            for _ in 0..OCTAVES {
-                h += perlin.get([x as f64 * freq, z as f64 * freq]) * amp;
-                freq *= LACUNARITY;
-                amp *= PERSISTENCE;
-            }
-            let h = h as f32 * HEIGHT_AMP;
+            let h = terrain.height_at(x, z);
             heights.push(h);
-            positions.push([x as f32 * cell, h, z as f32 * cell]);
+            positions.push([x as f32 * cell, h * HEIGHT_AMP, z as f32 * cell]);
         }
     }
 
     let h_min = heights.iter().cloned().fold(f32::INFINITY, f32::min);
     let h_max = heights.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let h_range = h_max - h_min;
 
-    let stops: [(f32, LinearRgba); 5] = [
-        (0.00, LinearRgba::new(0.15, 0.35, 0.10, 1.0)),
-        (0.30, LinearRgba::new(0.25, 0.55, 0.15, 1.0)),
-        (0.55, LinearRgba::new(0.55, 0.50, 0.20, 1.0)),
-        (0.80, LinearRgba::new(0.40, 0.28, 0.15, 1.0)),
-        (1.00, LinearRgba::new(0.85, 0.83, 0.80, 1.0)),
-    ];
-
+    // -- vertex colors --
     for &h in &heights {
-        let t = if h_range > 0.0 {
-            ((h - h_min) / h_range).clamp(0.0, 1.0)
-        } else {
-            0.5
-        };
-        let c = if t <= stops[0].0 {
-            stops[0].1
-        } else if t >= stops[4].0 {
-            stops[4].1
-        } else {
-            let mut lo = 0;
-            while stops[lo + 1].0 < t {
-                lo += 1;
-            }
-            let s = (t - stops[lo].0) / (stops[lo + 1].0 - stops[lo].0);
-            lerp_color(stops[lo].1, stops[lo + 1].1, s)
-        };
+        let c = height_to_color(h, h_min, h_max);
         colors.push(c.to_f32_array());
     }
 
-    // -- indices --
-    for z in 0..TERRAIN_SIZE {
-        for x in 0..TERRAIN_SIZE {
+    // -- indices (two triangles per quad) --
+    for z in 0..(n - 1) {
+        for x in 0..(n - 1) {
             let a = (z * n + x) as u32;
             let b = a + 1;
             let c = a + n as u32;
