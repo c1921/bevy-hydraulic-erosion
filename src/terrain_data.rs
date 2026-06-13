@@ -132,6 +132,28 @@ impl TerrainResource {
         }
     }
 
+    // ── Tracking 操作 ──────────────────────────────────────────
+
+    /// 清零所有 cell 的 tracking maps（每次 erode 循环前调用）
+    pub fn clear_tracking(&mut self) {
+        for cell in &mut self.cells {
+            cell.discharge_track = 0.0;
+            cell.momentum_x_track = 0.0;
+            cell.momentum_y_track = 0.0;
+        }
+    }
+
+    /// 指数滑动平均：将 tracking maps 合并到持久场
+    pub fn merge_tracking(&mut self, learning_rate: f32) {
+        let lr = learning_rate;
+        let one_minus_lr = 1.0 - lr;
+        for cell in &mut self.cells {
+            cell.discharge = one_minus_lr * cell.discharge + lr * cell.discharge_track;
+            cell.momentum_x = one_minus_lr * cell.momentum_x + lr * cell.momentum_x_track;
+            cell.momentum_y = one_minus_lr * cell.momentum_y + lr * cell.momentum_y_track;
+        }
+    }
+
     // ── 迭代器 ───────────────────────────────────────────────
 
     /// 所有 Cell 的可变引用迭代器（跨整个网格）
@@ -222,5 +244,43 @@ mod tests {
         // This is the expected behavior for particle acceleration
         assert!(n.y > 0.0, "normal should point upward");
         assert!(n.x > 0.0, "normal should point downhill (+x), got n.x={}", n.x);
+    }
+
+    #[test]
+    fn clear_tracking_zeros_all() {
+        let mut t = TerrainResource::new(4);
+        // Set tracking to non-zero values
+        for cell in t.cells_mut_iter() {
+            cell.discharge_track = 1.0;
+            cell.momentum_x_track = 2.0;
+            cell.momentum_y_track = 3.0;
+        }
+        t.clear_tracking();
+        for cell in t.cells_iter() {
+            assert_eq!(cell.discharge_track, 0.0);
+            assert_eq!(cell.momentum_x_track, 0.0);
+            assert_eq!(cell.momentum_y_track, 0.0);
+        }
+    }
+
+    #[test]
+    fn merge_tracking_ema() {
+        let mut t = TerrainResource::new(2);
+        // persistent = 0 initially, track = 10, lr = 0.5
+        t.cell_mut(0, 0).discharge = 0.0;
+        t.cell_mut(0, 0).discharge_track = 10.0;
+        t.cell_mut(0, 0).momentum_x = 0.0;
+        t.cell_mut(0, 0).momentum_x_track = 4.0;
+        t.cell_mut(0, 0).momentum_y = 2.0;
+        t.cell_mut(0, 0).momentum_y_track = 6.0;
+
+        t.merge_tracking(0.5);
+
+        // discharge = 0.5*0 + 0.5*10 = 5
+        assert!((t.cell(0, 0).discharge - 5.0).abs() < 0.001);
+        // momentum_x = 0.5*0 + 0.5*4 = 2
+        assert!((t.cell(0, 0).momentum_x - 2.0).abs() < 0.001);
+        // momentum_y = 0.5*2 + 0.5*6 = 4
+        assert!((t.cell(0, 0).momentum_y - 4.0).abs() < 0.001);
     }
 }

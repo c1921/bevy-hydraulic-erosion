@@ -1,6 +1,7 @@
 mod camera;
 mod cell;
 mod config;
+mod erosion;
 mod lighting;
 mod terrain;
 mod terrain_data;

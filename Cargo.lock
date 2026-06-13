@@ -353,6 +353,7 @@ dependencies = [
  "bevy",
  "bytemuck",
  "noise",
+ "rand 0.9.4",
 ]
 
 [[package]]
