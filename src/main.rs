@@ -1,5 +1,6 @@
 use bevy::{
     input::mouse::MouseWheel,
+    pbr::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
 };
@@ -81,6 +82,13 @@ fn setup(
             1.2,
             0.0,
         )),
+        CascadeShadowConfigBuilder {
+            num_cascades: 4,
+            maximum_distance: 1500.0,
+            first_cascade_far_bound: 200.0,
+            ..default()
+        }
+        .build(),
     ));
 
     // ── ambient light ──
@@ -88,6 +96,9 @@ fn setup(
         color: Color::WHITE,
         brightness: 400.0,
     });
+
+    // ── shadow map resolution ──
+    commands.insert_resource(DirectionalLightShadowMap { size: 4096 });
 
     // ── camera ──
     let ctrl = CameraController::default();
